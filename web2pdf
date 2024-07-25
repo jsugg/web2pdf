@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+This module contains a web scraper designed to recursively navigate a website starting 
+from a given base URL and convert the pages to PDF files. The scraper uses Playwright
+for web interaction and PDF generation. It is highly configurable, allowing the user 
+to specify parameters such as the maximum depth of recursion, page size for PDFs, 
+delay between requests, number of retries for failed requests, and the degree of 
+concurrency. The module also includes robust error handling, logging, and signal 
+handling mechanisms to gracefully shut down the scraping process if interrupted.
+
+Note: Ensure that `web2pdf` has execute permissions.
+If you are unsure, run `chmod +x web2pdf` in the project folder.
+
+Usage Examples:
+
+# Basic usage
+./web2pdf https://example.com
+
+# Specify output directory and maximum depth
+./web2pdf https://example.com --output-dir "output" --depth 3
+
+# Customize page size and delay between requests
+./web2pdf https://example.com --page-size Letter --delay 2
+
+# Enable verbose logging
+./web2pdf https://example.com --verbose
+
+# Advanced example
+./web2pdf --depth 2 --verbose --delay 1 --retries 3 --concurrency 20  --only github.io https://langchain-ai.github.io/langgraphjs/
+
+
+License: MIT License
+
+Author: Juan Sugg Gilbert
+Email: juanpedrosugg [at] gmail [dot] com
+"""
+
+import argparse
+import asyncio
+import logging
+import os
+import re
+import signal
+import sys
+import time
+import uuid
+from typing import Any, Dict, Set, List, Optional, NoReturn
+from urllib.parse import ParseResult, ParseResult, urlparse, urljoin
+
+import aiohttp
+import playwright
+from playwright.async_api import async_playwright, Browser, Page, Response
+from playwright._impl._errors import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+)
+from tqdm import tqdm
+import nbformat
+from nbconvert import HTMLExporter
+
+class WebScraper:
+    """A class to scrape websites and convert pages to PDFs using Playwright."""
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        log_level: Optional[int] = None,
+        log_format: Optional[str] = None,
+    ) -> None:
+        """
+        Initialize the WebScraper with the given configuration.
+
+        Args:
+            config (Dict[str, Any]): Configuration parameters for the scraper.
+        """
+        self.config: Dict[str, Any] = config
+        self.allowed_domains: List[str] = [domain.strip() for domain in config.get("allowed_domains", []) if domain.strip()]
+        self.base_url: str = config["base_url"]
+        self.output_dir: str = config["output_dir"]
+        self.max_depth: int = config["max_depth"]
+        self.page_size: str = config["page_size"]
+        self.delay: float = config["delay"]
+        self.retries: int = config["retries"]
+        self.concurrency: int = config["concurrency"]
+        self.max_pages: int = config["max_pages"]
+        self.timeout: int = config.get(
+            "timeout", 120000
+        )  # 120 seconds default
+
+        self.visited_urls: Set[str] = set()
+        self.pages_processed: int = 0
+        self.success_count: int = 0
+        self.error_count: int = 0
+        self.errored_urls: List[str] = []
+        self.stop_event = asyncio.Event()
+
+        self.browser: Browser | None = None
+
+        self._setup_output_directory()
+        self._setup_logging(log_level=log_level, log_format=log_format)
+
+    def _setup_output_directory(self) -> None:
+        """Create the output directory if it doesn't exist."""
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def _setup_logging(self, **kwargs) -> None:
+        """
+        Set up logging configuration based on keyword arguments.
+
+        This function uses keyword arguments to allow for flexible logging configuration.
+        Only sets up logging if 'log_level' is provided.
+
+        Kwargs:
+            log_level (int): Logging level to be used.
+            log_format (str): Specifies the logging format. Defaults to a standard format if not provided.
+        """
+        log_level = kwargs.get("log_level")
+        if log_level is not None:
+            log_format = kwargs.get(
+                "log_format", "%(asctime)s - %(levelname)s - %(message)s"
+            )
+            logging.basicConfig(level=log_level, format=log_format)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    async def _create_new_page(self) -> Page | None:
+        try:
+            if self.browser is None:
+                logging.error("Browser instance is None")
+                return None
+            page = await self.browser.new_page()
+            if page is None:
+                logging.error("Failed to create new page")
+                return None
+            page.set_default_navigation_timeout(self.timeout)
+            return page
+        except Exception as e:
+            logging.error("Error creating new page: %s", str(e))
+            return None
+
+    async def scrape_website(
+        self, url: str, depth: int = 0, page: Page | None = None
+    ) -> None:
+        if self.stop_event.is_set():
+            return
+
+        parsed_url = urlparse(url)
+        base_url = (
+            f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+        )
+
+        if await self._should_skip_url(base_url, depth):
+            return
+
+        self.visited_urls.add(base_url)
+
+        try:
+            if self.browser is None:
+                logging.error("Browser instance is None")
+                return
+
+            if page is None:
+                page = await self._create_new_page()
+                if page is None:
+                    logging.error("Failed to create new page for URL: %s", url)
+                    return
+
+            await self._navigate_to_url(page, url)
+            await self._convert_to_pdf(url, page)
+
+            self.pages_processed += 1
+            self.success_count += 1
+            self.update_progress()
+
+            if depth < self.max_depth:
+                await self._process_links(page, base_url, depth)
+
+        except (PlaywrightError, PlaywrightTimeoutError) as e:
+            await self._handle_error(url, e)
+        except Exception as e:
+            logging.error("Unexpected error processing %s: %s", url, str(e))
+            await self._handle_error(url, e)
+        finally:
+            if page:
+                await page.close()
+
+    async def _should_skip_url(self, url: str, depth: int) -> bool:
+        parsed_url: ParseResult = urlparse(url)
+        if self.allowed_domains:
+            domain_match = any(parsed_url.netloc.endswith(domain) for domain in self.allowed_domains)
+            if not domain_match:
+                return True  # Skip URLs not in the allowed domains
+        parsed_base_url: ParseResult = urlparse(self.base_url)
+        return (
+            depth > self.max_depth
+            or self.pages_processed >= self.max_pages
+            or url in self.visited_urls
+            or not parsed_url.netloc.endswith(parsed_base_url.netloc)
+        )
+
+    def is_jupyter_notebook_url(self, url: str) -> bool:
+        return url.endswith('.ipynb') or '.ipynb?' in url
+
+    async def _navigate_to_url(self, page: Page, url: str) -> None:
+        parsed_url: ParseResult = urlparse(url)
+        base_url: str = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+
+        for attempt in range(self.retries):
+            try:
+                if self.is_jupyter_notebook_url(url):
+                    # Handle Jupyter notebook automatic download
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url) as response:
+                            if response.status == 200:
+                                notebook_content = await response.text()
+                                notebook = nbformat.reads(notebook_content, as_version=4)
+                                html_exporter = HTMLExporter()
+                                html_content, _ = html_exporter.from_notebook_node(notebook)
+                                await page.set_content(html_content)
+                                await page.wait_for_load_state("networkidle", timeout=10000)
+                            else:
+                                raise PlaywrightError(f"Failed to download notebook: HTTP status {response.status}")
+                else:
+                    # Regular navigation
+                    response = await page.goto(
+                        base_url,
+                        wait_until="domcontentloaded",
+                        timeout=self.timeout,
+                    )
+
+                    if response and response.ok:
+                        if parsed_url.fragment or parsed_url.query:
+                            full_url = f"{base_url}{parsed_url.query}{parsed_url.fragment}"
+                            await page.evaluate(f"window.history.replaceState(null, '', '{full_url}');")
+                            await page.evaluate("window.scrollTo(0, 0);")
+
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=10000)
+                        except PlaywrightTimeoutError:
+                            logging.warning("Timeout waiting for network idle on %s", url)
+
+                        await asyncio.sleep(self.delay)
+                        return
+
+                    raise PlaywrightError(f"HTTP status {response.status if response else 'Unknown'}")
+                
+            except (PlaywrightError, PlaywrightTimeoutError) as e:
+                logging.warning("Attempt %d failed for %s: %s", attempt + 1, url, str(e))
+                if attempt == self.retries - 1:
+                    logging.error("Failed to retrieve %s after %d attempts", url, self.retries)
+                    raise
+                await asyncio.sleep(2**attempt)  # Exponential backoff
+
+    async def _convert_to_pdf(self, url: str, page: Page) -> None:
+        """
+        Convert the given page to a PDF file using Playwright.
+
+        Args:
+            url (str): The URL of the page being converted.
+            page (Page): The Playwright Page object of the page.
+        """
+        title: str = await page.title()
+        if not title:
+            title = await self._create_title(page)
+        sanitized_title: str = self._sanitize_filename(title)
+        sanitized_url: str = self._sanitize_filename(url)
+        unique_id: str = str(uuid.uuid4())[
+            :8
+        ]  # Use first 8 characters of a UUID
+
+        filename: str = (
+            f"{sanitized_title}__url_{sanitized_url}__page-id-{unique_id}.pdf"
+        )
+        filepath: str = os.path.join(self.output_dir, filename)
+
+        try:
+            await page.pdf(path=filepath, format=self.page_size)
+            logging.info("Created PDF: %s", filepath)
+        except Exception as e:
+            logging.error("Error creating PDF for %s: %s", url, str(e))
+            logging.error("Error details:", exc_info=True)
+
+    async def _create_title(self, page: Page) -> str:
+        """
+        Create a title from h1, h2, and h3 elements, handling cases where h2 or h3 appear before h1.
+        """
+        original_title: str = await page.title() or ''
+        title: str = ''
+
+        # Use JavaScript to extract all h1, h2, and h3 elements efficiently
+        title_parts = await page.evaluate(
+            """
+            () => {
+                const parts = [];
+                const headers = document.body.querySelectorAll('h1, h2, h3');
+                let firstH1Index = -1;
+                let lastH2BeforeH1Index = -1;
+                let lastH3BeforeH1Index = -1;
+
+                headers.forEach((header, index) => {
+                    if (header.tagName === 'H1' && firstH1Index === -1) {
+                        firstH1Index = index;
+                    }
+                    if (firstH1Index === -1) {
+                        if (header.tagName === 'H2') lastH2BeforeH1Index = index;
+                        if (header.tagName === 'H3') lastH3BeforeH1Index = index;
+                    }
+                });
+
+                // Handle headers before first H1
+                if (firstH1Index > 0) {
+                    if (lastH2BeforeH1Index !== -1) {
+                        parts.push(headers[lastH2BeforeH1Index].textContent.trim());
+                    } else if (lastH3BeforeH1Index !== -1) {
+                        for (let i = 0; i <= lastH3BeforeH1Index; i++) {
+                            parts.push(headers[i].textContent.trim());
+                        }
+                    }
+                }
+
+                // Process the rest of the headers
+                let currentH1Index = -1;
+                headers.forEach((header, index) => {
+                    if (index < firstH1Index) return; // Skip already processed headers
+
+                    if (header.tagName === 'H1') {
+                        if (currentH1Index !== -1) parts.push('__');
+                        currentH1Index = index;
+                        parts.push(header.textContent.trim());
+                    } else if (currentH1Index !== -1 && header.tagName === 'H2') {
+                        parts.push('_' + header.textContent.trim());
+                    }
+                });
+
+                // Remove trailing separator if exists
+                if (parts[parts.length - 1] === '__') {
+                    parts.pop();
+                }
+
+                return parts.join('');
+            }
+        """
+        )
+
+        # Clean up the title
+        # add the condition if title is instance of str
+        if isinstance(title, str) and title.strip() != "":
+            title = re.sub(
+                r"\s+", "-", title_parts
+            )  # Replace spaces with hyphens
+            title = re.sub(
+                r"[^\w\-_]", "", title
+            )  # Remove any non-word characters except hyphens and underscores
+            title = re.sub(
+                r"_+", "_", title
+            )  # Replace multiple underscores with a single one
+            title = re.sub(
+                r"-+", "-", title
+            )  # Replace multiple hyphens with a single one
+            title = title.strip(
+                "_-"
+            )  # Remove leading/trailing underscores and hyphens
+
+        if isinstance(original_title, str) and original_title.strip() != "":
+            '__'.join((original_title, title))
+        return title[
+            :130
+        ]  # Limit title length to 100 characters for file system compatibility
+
+    async def _process_links(
+        self, page: Page, base_url: str, depth: int
+    ) -> None:
+        if not self.stop_event.is_set():
+            links = await page.eval_on_selector_all(
+                "a[href]",
+                """
+                (elements) => elements.map(el => el.href)
+                """,
+            )
+
+            tasks = []
+            semaphore = asyncio.Semaphore(self.concurrency)
+
+            async def process_link(link):
+                async with semaphore:
+                    new_url = urljoin(base_url, link)
+                    # parsed_new_url = urlparse(new_url)
+                    # parsed_base_url = urlparse(self.base_url)
+
+                    if not await self._should_skip_url(new_url, depth + 1):
+                        await self.scrape_website(new_url, depth + 1)
+
+            for link in links:
+                tasks.append(asyncio.create_task(process_link(link)))
+
+            await asyncio.gather(*tasks)
+
+    async def _handle_error(self, url: str, error: Exception) -> None:
+        """
+        Handle errors that occur during scraping.
+
+        Args:
+            url (str): The URL where the error occurred.
+            error (Exception): The exception that was raised.
+        """
+        self.error_count += 1
+        self.errored_urls.append(
+            f"{url} | Error: {str(error)[:50]}..."
+        )
+        logging.error("Error processing %s: %s", url, str(error))
+
+    def _sanitize_filename(self, filename: str) -> str:
+        """
+        Sanitize the filename by removing invalid characters and truncating if necessary.
+
+        Args:
+            filename (str): The original filename.
+
+        Returns:
+            str: The sanitized filename.
+        """
+        # Remove invalid filename characters
+        sanitized: str = re.sub(r"[^\w\-_\. ]", "_", filename)
+        cleaned: str = sanitized.lstrip('_')
+        # Truncate to a reasonable length (e.g., 50 characters)
+        return cleaned[:100]
+
+    def _hash_url(self, url: str) -> str:
+        """
+        Create a short hash of the URL.
+
+        Args:
+            url (str): The URL to hash.
+
+        Returns:
+            str: A short hash of the URL.
+        """
+        return str(hash(url))[-8:]  # Use last 8 digits of the hash
+
+    async def run(self) -> None:
+        """Run the web scraper."""
+        async with async_playwright() as p:
+            try:
+                self.browser = await p.chromium.launch()
+                if not self.browser:
+                    raise Exception("Failed to launch browser")
+
+                with tqdm(
+                    total=self.max_pages, desc="Webpages processed"
+                ) as self.pbar:
+                    await self.scrape_website(self.base_url)
+            except Exception as e:
+                logging.error("Error initializing browser: %s", str(e))
+            finally:
+                if self.browser:
+                    await self.browser.close()
+                logging.info(
+                    "Finished scraping. Total pages processed: %d",
+                    self.pages_processed,
+                )
+                if self.error_count > 0:
+                    logging.info(
+                        "Successful conversions: %d", self.success_count
+                    )
+                    logging.info("Errors encountered: %d", self.error_count)
+                    if self.errored_urls:
+                        logging.info("Errored URLs:")
+                        for idx, err_url in enumerate(self.errored_urls, 1):
+                            logging.info("  %d. %s", idx, err_url)  # Log each errored URL
+
+    def update_progress(self) -> None:
+        """Update the progress bar."""
+        self.pbar.n = self.pages_processed
+        self.pbar.refresh()
+
+
+def handle_signal(signum: int, frame: Any) -> None:
+    """
+    Handle termination signals.
+
+    Args:
+        signum (int): The signal number.
+        frame (Any): The current stack frame.
+    """
+    logging.info("Received signal %d. Shutting down gracefully...", signum)
+    asyncio.create_task(force_exit(5))
+
+
+async def force_exit(delay: int) -> NoReturn:
+    """
+    Force exit the program after a specified delay.
+
+    Args:
+        delay (int): The delay in seconds before exiting.
+    """
+    logging.warning("Forcing exit in %d seconds...", delay)
+    await asyncio.sleep(delay)
+    logging.warning("Force exiting now")
+    os._exit(1)
+
+
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+
+    Returns:
+        argparse.Namespace: The parsed arguments.
+    """
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="Recursively scrape a website and convert pages to PDFs using Playwright."
+    )
+    parser.add_argument(
+        "url", type=str, help="The base URL of the website to scrape."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="pdfs",
+        help="The directory to save PDFs.",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=2,
+        help="The maximum depth of recursion for scraping.",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=str,
+        default="A4",
+        help="The page size for the PDFs.",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.0,
+        help="The delay in seconds between requests.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="The number of retries for failed requests.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="The number of concurrent requests to execute.",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=100,
+        help="The maximum number of pages to scrape.",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable verbose logging"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=60000,
+        help="Timeout for page navigation in milliseconds.",
+    )
+    parser.add_argument(
+        "--only",
+        type=str,
+        default="",
+        help="Comma-separated list of allowed high-level domains for scraping.",
+    )
+    return parser.parse_args()
+
+
+def check_install_dependencies() -> None:
+    """Check and install required Python packages if not already installed."""
+    required_packages: List[str] = ["playwright", "aiohttp", "nbformat", "nbconvert", "tqdm"]
+    for package in required_packages:
+        try:
+            __import__(package)
+        except ImportError:
+            print(f"Installing {package}...")
+            os.system(f"{sys.executable} -m pip install {package}")    
+            print("Installing Playwright browsers...")
+            os.system(f"{sys.executable} -m playwright install")
+
+async def main() -> None:
+    """Main function to run the web scraper."""
+
+    check_install_dependencies()
+
+    args: argparse.Namespace = parse_arguments()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    config: Dict[str, Any] = {
+        "base_url": args.url,
+        "output_dir": args.output_dir,
+        "max_depth": args.depth,
+        "page_size": args.page_size,
+        "delay": args.delay,
+        "retries": args.retries,
+        "concurrency": args.concurrency,
+        "max_pages": args.max_pages,
+        "timeout": args.timeout,
+        "allowed_domains": args.only.split(",") if args.only else [],
+    }
+
+    log_level = logging.INFO if args.verbose else logging.WARNING
+    scraper: WebScraper = WebScraper(config, log_level=log_level)
+
+    try:
+        await scraper.run()
+    except Exception as e:
+        logging.error("An error occurred: %s", str(e))
+        logging.debug("Error details:", exc_info=True)
+    finally:
+        if scraper.error_count > 0:
+            logging.info("Successful conversions: %d", scraper.success_count)
+            logging.info("Errors encountered: %d", scraper.error_count)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
