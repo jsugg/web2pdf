@@ -26,17 +26,17 @@ The module includes comprehensive error handling, logging, and signal handling m
 
 ### Specify Output Directory and Maximum Depth
 ```sh
-./web2pdf https://example.com --output-dir "output" --depth 3
+./web2pdf --output-dir "output" --depth 3 https://example.com
 ```
 
 ### Customize Page Size and Delay Between Requests
 ```sh
-./web2pdf https://example.com --page-size Letter --delay 2
+./web2pdf --page-size Letter --delay 2 https://example.com
 ```
 
 ### Enable Verbose Logging
 ```sh
-./web2pdf https://example.com --verbose
+./web2pdf --verbose https://example.com
 ```
 
 ### Advanced Example
