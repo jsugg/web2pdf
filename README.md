@@ -67,6 +67,26 @@ To install the required dependencies, run:
 pip install -r requirements.txt
 ```
 
+Install additional dependeencies:
+
+For MacOS:
+```sh
+brew install gs
+brew install inkscape
+```
+
+For Linux:
+```sh
+sudo apt-get install gs
+sudo apt-get install inkscape
+```
+
+For Windows (WLS):
+```sh
+sudo apt install gs
+sudo apt install inkscape
+```
+
 Ensure that `web2pdf` has execute permissions. If you are unsure, run:
 ```sh
 chmod +x web2pdf

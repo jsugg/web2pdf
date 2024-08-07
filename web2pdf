@@ -28,7 +28,6 @@ Usage Examples:
 # Advanced example
 ./web2pdf --depth 2 --verbose --delay 1 --retries 3 --concurrency 20  --only github.io https://langchain-ai.github.io/langgraphjs/
 
-
 License: MIT License
 
 Author: Juan Sugg Gilbert
@@ -40,23 +39,37 @@ import asyncio
 import logging
 import os
 import re
-import signal
 import sys
-import time
 import uuid
-from typing import Any, Dict, Set, List, Optional, NoReturn
-from urllib.parse import ParseResult, ParseResult, urlparse, urljoin
+import signal
+import resource
+from typing import Any, Coroutine, Dict, NoReturn, Set, List, Optional, Union
+from urllib.parse import (
+    ParseResult,
+    urlparse,
+    urlunparse,
+    urlencode,
+    urljoin,
+    parse_qs,
+)
 
 import aiohttp
-import playwright
-from playwright.async_api import async_playwright, Browser, Page, Response
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    Page,
+    Response as PlaywrightResponse,
+)
 from playwright._impl._errors import (
     Error as PlaywrightError,
     TimeoutError as PlaywrightTimeoutError,
 )
+from playwright.async_api._generated import BrowserContext
 from tqdm import tqdm
+from PyPDF2 import PdfMerger
 import nbformat
 from nbconvert import HTMLExporter
+
 
 class WebScraper:
     """A class to scrape websites and convert pages to PDFs using Playwright."""
@@ -74,8 +87,12 @@ class WebScraper:
             config (Dict[str, Any]): Configuration parameters for the scraper.
         """
         self.config: Dict[str, Any] = config
-        self.allowed_domains: List[str] = [domain.strip() for domain in config.get("allowed_domains", []) if domain.strip()]
-        self.base_url: str = config["base_url"]
+        self.allowed_domains: List[str] = config.get("allowed_domains", [])
+        self.excluded_urls: Set[str] = {
+            url.strip() for url in config.get("excluded_urls", [])
+        }
+        self.base_url: str = str(config["base_url"])
+        self.pagination_enabled: bool = config.get("pagination", False)
         self.output_dir: str = config["output_dir"]
         self.max_depth: int = config["max_depth"]
         self.page_size: str = config["page_size"]
@@ -86,40 +103,54 @@ class WebScraper:
         self.timeout: int = config.get(
             "timeout", 120000
         )  # 120 seconds default
+        self.origin_url: str = config["base_url"]
+        self.links_only: bool = config.get("links_only", False)
 
         self.visited_urls: Set[str] = set()
         self.pages_processed: int = 0
         self.success_count: int = 0
         self.error_count: int = 0
         self.errored_urls: List[str] = []
-        self.stop_event = asyncio.Event()
+        self.stop_event: asyncio.Event = asyncio.Event()
 
         self.browser: Browser | None = None
+        self.file_descriptor_semaphore: asyncio.Semaphore = asyncio.Semaphore(
+            self._calculate_max_file_descriptors()
+        )
+        self.page_semaphore: asyncio.Semaphore = asyncio.Semaphore(
+            self.concurrency
+        )
 
         self._setup_output_directory()
         self._setup_logging(log_level=log_level, log_format=log_format)
+
+    def _calculate_max_file_descriptors(self) -> int:
+        """Calculate the maximum number of file descriptors to use (80% of the available ones)."""
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        return int(soft_limit * 0.8)
 
     def _setup_output_directory(self) -> None:
         """Create the output directory if it doesn't exist."""
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _setup_logging(self, **kwargs) -> None:
+    def _setup_logging(
+        self, log_level: Optional[int] = None, log_format: Optional[str] = None
+    ) -> None:
         """
         Set up logging configuration based on keyword arguments.
 
         This function uses keyword arguments to allow for flexible logging configuration.
         Only sets up logging if 'log_level' is provided.
 
-        Kwargs:
+        Args:
             log_level (int): Logging level to be used.
             log_format (str): Specifies the logging format. Defaults to a standard format if not provided.
         """
-        log_level = kwargs.get("log_level")
-        if log_level is not None:
-            log_format = kwargs.get(
-                "log_format", "%(asctime)s - %(levelname)s - %(message)s"
-            )
-            logging.basicConfig(level=log_level, format=log_format)
+        _log_format: str = (
+            log_format or "%(asctime)s - %(levelname)s - %(message)s"
+        )
+        _log_level: int = log_level or logging.INFO
+        logging.basicConfig(level=_log_level, format=_log_format)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -129,10 +160,7 @@ class WebScraper:
             if self.browser is None:
                 logging.error("Browser instance is None")
                 return None
-            page = await self.browser.new_page()
-            if page is None:
-                logging.error("Failed to create new page")
-                return None
+            page: Page = await self.browser.new_page()
             page.set_default_navigation_timeout(self.timeout)
             return page
         except Exception as e:
@@ -145,110 +173,131 @@ class WebScraper:
         if self.stop_event.is_set():
             return
 
-        parsed_url = urlparse(url)
-        base_url = (
-            f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-        )
+        async with self.file_descriptor_semaphore:
+            parsed_url: ParseResult = urlparse(url)
+            base_url: str = urlunparse(
+                (
+                    parsed_url.scheme,
+                    parsed_url.netloc,
+                    parsed_url.path,
+                    "",
+                    "",
+                    "",
+                )
+            )
 
-        if await self._should_skip_url(base_url, depth):
-            return
-
-        self.visited_urls.add(base_url)
-
-        try:
-            if self.browser is None:
-                logging.error("Browser instance is None")
+            if await self._should_skip_url(base_url, depth):
                 return
 
-            if page is None:
-                page = await self._create_new_page()
+            self.visited_urls.add(base_url)
+            page_created = False
+
+            try:
+                if self.browser is None:
+                    logging.error("Browser instance is None")
+                    return
+
+                if page is None:
+                    page = await self._create_new_page()
+                    page_created = True
                 if page is None:
                     logging.error("Failed to create new page for URL: %s", url)
                     return
 
-            await self._navigate_to_url(page, url)
-            await self._convert_to_pdf(url, page)
+                await self._navigate_to_url(page, url)
 
-            self.pages_processed += 1
-            self.success_count += 1
-            self.update_progress()
+                if not self.links_only or url != self.origin_url:
+                    await self._convert_to_pdf(url, page)
+                    self.pages_processed += 1
+                    self.success_count += 1
+                    self.update_progress()
 
-            if depth < self.max_depth:
-                await self._process_links(page, base_url, depth)
+                if depth < self.max_depth:
+                    await self._process_links(page, base_url, depth)
 
-        except (PlaywrightError, PlaywrightTimeoutError) as e:
-            await self._handle_error(url, e)
-        except Exception as e:
-            logging.error("Unexpected error processing %s: %s", url, str(e))
-            await self._handle_error(url, e)
-        finally:
-            if page:
-                await page.close()
-
-    async def _should_skip_url(self, url: str, depth: int) -> bool:
-        parsed_url: ParseResult = urlparse(url)
-        if self.allowed_domains:
-            domain_match = any(parsed_url.netloc.endswith(domain) for domain in self.allowed_domains)
-            if not domain_match:
-                return True  # Skip URLs not in the allowed domains
-        parsed_base_url: ParseResult = urlparse(self.base_url)
-        return (
-            depth > self.max_depth
-            or self.pages_processed >= self.max_pages
-            or url in self.visited_urls
-            or not parsed_url.netloc.endswith(parsed_base_url.netloc)
-        )
+            except (PlaywrightError, PlaywrightTimeoutError) as e:
+                await self._handle_error(url, e)
+            except Exception as e:
+                logging.error(
+                    "Unexpected error processing %s: %s", url, str(e)
+                )
+                await self._handle_error(url, e)
+            finally:
+                if page_created and page:
+                    await page.close()
 
     def is_jupyter_notebook_url(self, url: str) -> bool:
-        return url.endswith('.ipynb') or '.ipynb?' in url
+        return url.endswith(".ipynb") or ".ipynb?" in url
 
     async def _navigate_to_url(self, page: Page, url: str) -> None:
         parsed_url: ParseResult = urlparse(url)
-        base_url: str = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
         for attempt in range(self.retries):
             try:
                 if self.is_jupyter_notebook_url(url):
                     # Handle Jupyter notebook automatic download
                     async with aiohttp.ClientSession() as session:
-                        async with session.get(url) as response:
-                            if response.status == 200:
-                                notebook_content = await response.text()
-                                notebook = nbformat.reads(notebook_content, as_version=4)
+                        async with session.get(url) as response:  # type: ignore
+                            if response:
+                                if response.status != 200:
+                                    raise PlaywrightError(
+                                        f"Failed to download notebook: HTTP status {response.status}"
+                                    )
+                                notebook_content: str = await response.text()
+                                notebook: nbformat.NotebookNode = (
+                                    nbformat.reads(
+                                        notebook_content, as_version=4
+                                    )
+                                )
                                 html_exporter = HTMLExporter()
-                                html_content, _ = html_exporter.from_notebook_node(notebook)
+                                html_content, _ = (
+                                    html_exporter.from_notebook_node(notebook)
+                                )
                                 await page.set_content(html_content)
-                                await page.wait_for_load_state("networkidle", timeout=10000)
-                            else:
-                                raise PlaywrightError(f"Failed to download notebook: HTTP status {response.status}")
+                                await page.wait_for_load_state(
+                                    "networkidle", timeout=10000
+                                )
                 else:
                     # Regular navigation
-                    response = await page.goto(
-                        base_url,
+                    response: Optional[PlaywrightResponse] = await page.goto(
+                        url,  # Use the full URL here
                         wait_until="domcontentloaded",
                         timeout=self.timeout,
                     )
 
                     if response and response.ok:
                         if parsed_url.fragment or parsed_url.query:
-                            full_url = f"{base_url}{parsed_url.query}{parsed_url.fragment}"
-                            await page.evaluate(f"window.history.replaceState(null, '', '{full_url}');")
+                            await page.evaluate(
+                                f"window.history.replaceState(null, '', '{url}');"
+                            )
                             await page.evaluate("window.scrollTo(0, 0);")
 
                         try:
-                            await page.wait_for_load_state("networkidle", timeout=10000)
+                            await page.wait_for_load_state(
+                                "networkidle", timeout=10000
+                            )
                         except PlaywrightTimeoutError:
-                            logging.warning("Timeout waiting for network idle on %s", url)
+                            logging.warning(
+                                "Timeout waiting for network idle on %s", url
+                            )
 
                         await asyncio.sleep(self.delay)
                         return
 
-                    raise PlaywrightError(f"HTTP status {response.status if response else 'Unknown'}")
-                
+                    raise PlaywrightError(
+                        f"HTTP status {response.status if response else 'Unknown'}"
+                    )
+
             except (PlaywrightError, PlaywrightTimeoutError) as e:
-                logging.warning("Attempt %d failed for %s: %s", attempt + 1, url, str(e))
+                logging.warning(
+                    "Attempt %d failed for %s: %s", attempt + 1, url, str(e)
+                )
                 if attempt == self.retries - 1:
-                    logging.error("Failed to retrieve %s after %d attempts", url, self.retries)
+                    logging.error(
+                        "Failed to retrieve %s after %d attempts",
+                        url,
+                        self.retries,
+                    )
                     raise
                 await asyncio.sleep(2**attempt)  # Exponential backoff
 
@@ -265,9 +314,7 @@ class WebScraper:
             title = await self._create_title(page)
         sanitized_title: str = self._sanitize_filename(title)
         sanitized_url: str = self._sanitize_filename(url)
-        unique_id: str = str(uuid.uuid4())[
-            :8
-        ]  # Use first 8 characters of a UUID
+        unique_id: str = str(uuid.uuid4())[:8]
 
         filename: str = (
             f"{sanitized_title}__url_{sanitized_url}__page-id-{unique_id}.pdf"
@@ -285,11 +332,11 @@ class WebScraper:
         """
         Create a title from h1, h2, and h3 elements, handling cases where h2 or h3 appear before h1.
         """
-        original_title: str = await page.title() or ''
-        title: str = ''
+        original_title: str = await page.title() or ""
+        title: str = ""
 
         # Use JavaScript to extract all h1, h2, and h3 elements efficiently
-        title_parts = await page.evaluate(
+        title_parts: str = await page.evaluate(
             """
             () => {
                 const parts = [];
@@ -363,38 +410,123 @@ class WebScraper:
             )  # Remove leading/trailing underscores and hyphens
 
         if isinstance(original_title, str) and original_title.strip() != "":
-            '__'.join((original_title, title))
+            "__".join((original_title, title))
         return title[
             :130
         ]  # Limit title length to 100 characters for file system compatibility
 
-    async def _process_links(
-        self, page: Page, base_url: str, depth: int
-    ) -> None:
-        if not self.stop_event.is_set():
-            links = await page.eval_on_selector_all(
-                "a[href]",
-                """
-                (elements) => elements.map(el => el.href)
-                """,
+    def _join_url(self, base: str, url: str) -> str:
+        joined_url: str = urljoin(base, url)
+        parsed_join: ParseResult = urlparse(joined_url)
+        parsed_base: ParseResult = urlparse(base)
+
+        # Preserve query parameters from both base and joined URL
+        query_params: Dict[str, List[str]] = parse_qs(parsed_base.query)
+        query_params |= parse_qs(parsed_join.query)
+
+        return urlunparse(
+            (
+                parsed_join.scheme,
+                parsed_join.netloc,
+                parsed_join.path,
+                parsed_join.params,
+                urlencode(query_params, doseq=True),
+                parsed_join.fragment,
             )
+        )
 
-            tasks = []
-            semaphore = asyncio.Semaphore(self.concurrency)
+    async def _process_links(
+        self, page: Page, current_url: str, depth: int
+    ) -> None:
+        if self.stop_event.is_set():
+            return
 
-            async def process_link(link):
-                async with semaphore:
-                    new_url = urljoin(base_url, link)
-                    # parsed_new_url = urlparse(new_url)
-                    # parsed_base_url = urlparse(self.base_url)
+        links: List[str] = await page.eval_on_selector_all(
+            "a[href]",
+            """
+            (elements) => elements.map(el => el.href)
+            """,
+        )
 
-                    if not await self._should_skip_url(new_url, depth + 1):
-                        await self.scrape_website(new_url, depth + 1)
+        resolved_links: List[str] = [
+            self._join_url(current_url, link) for link in links
+        ]
 
-            for link in links:
-                tasks.append(asyncio.create_task(process_link(link)))
+        if self.pagination_enabled:
+            pagination_links: List[str] = [
+                link
+                for link in resolved_links
+                if self._is_pagination_link(link)
+            ]
+            other_links: List[str] = [
+                link for link in resolved_links if link not in pagination_links
+            ]
 
+            for link in pagination_links:
+                if not await self._should_skip_url(link, depth):
+                    await self.scrape_website(link, depth)
+        else:
+            other_links = resolved_links
+
+        async with self.page_semaphore:
+            tasks: List[Coroutine[Any, Any, None]] = [
+                self.scrape_website(link, depth + 1)
+                for link in other_links
+                if not await self._should_skip_url(link, depth + 1)
+            ]
             await asyncio.gather(*tasks)
+
+    def _is_pagination_link(self, url: str) -> bool:
+        if not self.pagination_enabled:
+            return False
+
+        parsed_url: ParseResult = urlparse(url)
+        query_params: Dict[str, List[str]] = parse_qs(parsed_url.query)
+
+        is_allowed_domain: bool = any(
+            parsed_url.netloc.endswith(domain)
+            for domain in self.allowed_domains
+        )
+        has_page_param: bool = any(
+            param.lower() == "page" for param in query_params
+        )
+
+        # Check if the URL is similar to the base URL
+        parsed_base_url: ParseResult = urlparse(self.base_url)
+        is_similar_to_base: bool = (
+            parsed_url.scheme == parsed_base_url.scheme
+            and parsed_url.netloc == parsed_base_url.netloc
+            and parsed_url.path == parsed_base_url.path
+        )
+
+        return is_allowed_domain and has_page_param and is_similar_to_base
+
+    async def _should_skip_url(self, url: str, depth: int) -> bool:
+        if depth > self.max_depth:
+            logging.debug(f"Skipping {url} due to depth limit")
+            return True
+
+        if url in self.visited_urls:
+            logging.debug(f"Skipping {url} as it has already been visited")
+            return True
+
+        parsed_url: ParseResult = urlparse(url)
+        if self.allowed_domains:
+            netloc_path: str = parsed_url.netloc + str(parsed_url.path)
+            logging.debug(
+                f"Checking {netloc_path} against allowed domains: {self.allowed_domains}"
+            )
+            if not any(
+                netloc_path.startswith(domain)
+                for domain in self.allowed_domains
+            ):
+                logging.debug(
+                    f"Skipping {url} as it doesn't match any allowed domain"
+                )
+                return True
+
+        logging.debug(f"URL {url} passed all checks and will be processed")
+        return False
 
     async def _handle_error(self, url: str, error: Exception) -> None:
         """
@@ -405,9 +537,7 @@ class WebScraper:
             error (Exception): The exception that was raised.
         """
         self.error_count += 1
-        self.errored_urls.append(
-            f"{url} | Error: {str(error)[:50]}..."
-        )
+        self.errored_urls.append(f"{url} | Error: {str(error)[:50]}...")
         logging.error("Error processing %s: %s", url, str(error))
 
     def _sanitize_filename(self, filename: str) -> str:
@@ -422,7 +552,7 @@ class WebScraper:
         """
         # Remove invalid filename characters
         sanitized: str = re.sub(r"[^\w\-_\. ]", "_", filename)
-        cleaned: str = sanitized.lstrip('_')
+        cleaned: str = sanitized.lstrip("_")
         # Truncate to a reasonable length (e.g., 50 characters)
         return cleaned[:100]
 
@@ -438,20 +568,52 @@ class WebScraper:
         """
         return str(hash(url))[-8:]  # Use last 8 digits of the hash
 
+    def merge_pdfs(self) -> None:
+        merger = PdfMerger()
+        pdf_files: List[str] = [
+            f for f in os.listdir(self.output_dir) if f.endswith(".pdf")
+        ]
+        pdf_files.sort()
+
+        for pdf in pdf_files:
+            file_path: str = os.path.join(self.output_dir, pdf)
+            merger.append(file_path)
+
+        output_path: str = os.path.join(self.output_dir, "merged_output.pdf")
+        merger.write(output_path)
+        merger.close()
+
+        logging.info(f"All PDFs merged into: {output_path}")
+
+        # Optionally, remove individual PDF files
+        if self.config.get("remove_individual_pdfs", False):
+            for pdf in pdf_files:
+                os.remove(os.path.join(self.output_dir, pdf))
+            logging.info("Individual PDF files removed after merging.")
+
     async def run(self) -> None:
-        """Run the web scraper."""
         async with async_playwright() as p:
             try:
                 self.browser = await p.chromium.launch()
                 if not self.browser:
                     raise Exception("Failed to launch browser")
 
+                browser_context: BrowserContext = (
+                    await self.browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    )
+                )
+
                 with tqdm(
                     total=self.max_pages, desc="Webpages processed"
                 ) as self.pbar:
-                    await self.scrape_website(self.base_url)
+                    page: Page = await browser_context.new_page()
+                    await self.scrape_website(
+                        str(self.base_url), depth=0, page=page
+                    )
             except Exception as e:
                 logging.error("Error initializing browser: %s", str(e))
+                logging.error("Error details:", exc_info=True)
             finally:
                 if self.browser:
                     await self.browser.close()
@@ -467,7 +629,10 @@ class WebScraper:
                     if self.errored_urls:
                         logging.info("Errored URLs:")
                         for idx, err_url in enumerate(self.errored_urls, 1):
-                            logging.info("  %d. %s", idx, err_url)  # Log each errored URL
+                            logging.info("  %d. %s", idx, err_url)
+
+                if self.config.get("merge", False):
+                    self.merge_pdfs()
 
     def update_progress(self) -> None:
         """Update the progress bar."""
@@ -501,12 +666,6 @@ async def force_exit(delay: int) -> NoReturn:
 
 
 def parse_arguments() -> argparse.Namespace:
-    """
-    Parse command-line arguments.
-
-    Returns:
-        argparse.Namespace: The parsed arguments.
-    """
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         description="Recursively scrape a website and convert pages to PDFs using Playwright."
     )
@@ -568,35 +727,68 @@ def parse_arguments() -> argparse.Namespace:
         "--only",
         type=str,
         default="",
-        help="Comma-separated list of allowed high-level domains for scraping.",
+        help="Comma-separated list of allowed domains or URL prefixes for scraping.",
+    )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge all created PDFs into a single file",
+    )
+    parser.add_argument(
+        "--exclude-url",
+        type=str,
+        default="",
+        help="Comma-separated list of URLs to exclude from scraping.",
+    )
+    parser.add_argument(
+        "--links-only",
+        action="store_true",
+        help="Only scrape links from the origin page without converting it to PDF",
+    )
+    parser.add_argument(
+        "--pagination",
+        action="store_true",
+        help="Enable pagination handling for multi-page content",
     )
     return parser.parse_args()
 
 
 def check_install_dependencies() -> None:
     """Check and install required Python packages if not already installed."""
-    required_packages: List[str] = ["playwright", "aiohttp", "nbformat", "nbconvert", "tqdm"]
+    required_packages: List[str] = [
+        "playwright",
+        "aiohttp",
+        "nbformat",
+        "nbconvert",
+        "tqdm",
+        "PyPDF2",
+    ]
     for package in required_packages:
         try:
             __import__(package)
         except ImportError:
             print(f"Installing {package}...")
-            os.system(f"{sys.executable} -m pip install {package}")    
+            os.system(f"{sys.executable} -m pip install {package}")
             print("Installing Playwright browsers...")
             os.system(f"{sys.executable} -m playwright install")
 
+
 async def main() -> None:
-    """Main function to run the web scraper."""
-
-    check_install_dependencies()
-
     args: argparse.Namespace = parse_arguments()
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    # Parse the --only argument
+    allowed_domains: List[str] = []
+    if args.only:
+        for domain in args.only.split(","):
+            domain: str = domain.strip()
+            if not domain.startswith(("http://", "https://")):
+                allowed_domains.append(domain)
+            else:
+                parsed: ParseResult = urlparse(domain)
+                allowed_domains.append(parsed.netloc + parsed.path)
 
-    config: Dict[str, Any] = {
-        "base_url": args.url,
+    config: Dict[str, Union[str, int, bool, List[str]]] = {
+        "base_url": str(args.url),
         "output_dir": args.output_dir,
         "max_depth": args.depth,
         "page_size": args.page_size,
@@ -605,11 +797,22 @@ async def main() -> None:
         "concurrency": args.concurrency,
         "max_pages": args.max_pages,
         "timeout": args.timeout,
-        "allowed_domains": args.only.split(",") if args.only else [],
+        "allowed_domains": allowed_domains,
+        "merge": args.merge,
+        "excluded_urls": (
+            args.exclude_url.split(",") if args.exclude_url else []
+        ),
+        "links_only": (
+            args.links_only if hasattr(args, "links_only") else False
+        ),
+        "pagination": args.pagination,
     }
 
-    log_level = logging.INFO if args.verbose else logging.WARNING
+    log_level: int = logging.INFO if args.verbose else logging.WARNING
     scraper: WebScraper = WebScraper(config, log_level=log_level)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         await scraper.run()
@@ -623,4 +826,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    check_install_dependencies()
     asyncio.run(main())
