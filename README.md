@@ -16,6 +16,8 @@ The module includes comprehensive error handling, logging, and signal handling m
 - **Jupyter Notebook Support**: Convert Jupyter Notebooks to PDFs.
 - **Robust Error Handling**: Comprehensive error and signal handling for smooth operation.
 - **Logging**: Detailed logging to monitor the scraping process.
+- **Pagination Support**: Handle multi-page content with pagination.
+- **Merge PDFs**: Optionally merge all created PDFs into a single file.
 
 ## Usage
 
@@ -26,17 +28,17 @@ The module includes comprehensive error handling, logging, and signal handling m
 
 ### Specify Output Directory and Maximum Depth
 ```sh
-./web2pdf --output-dir "output" --depth 3 https://example.com
+./web2pdf https://example.com --output-dir "output" --depth 3
 ```
 
 ### Customize Page Size and Delay Between Requests
 ```sh
-./web2pdf --page-size Letter --delay 2 https://example.com
+./web2pdf https://example.com --page-size Letter --delay 2
 ```
 
 ### Enable Verbose Logging
 ```sh
-./web2pdf --verbose https://example.com
+./web2pdf https://example.com --verbose
 ```
 
 ### Advanced Example
@@ -46,19 +48,23 @@ The module includes comprehensive error handling, logging, and signal handling m
 
 ## CLI Flags
 
-| Flag          | Description                                                                                  | Default Value |
-|---------------|----------------------------------------------------------------------------------------------|---------------|
-| `url`         | The base URL of the website to scrape.                                                       |               |
-| `--output-dir`| The directory to save PDFs.                                                                  | `pdfs`        |
-| `--depth`     | The maximum depth of recursion for scraping.                                                 | `2`           |
-| `--page-size` | The page size for the PDFs (e.g., A4, Letter, Legal, etc.).                                               | `A4`          |
-| `--delay`     | The delay in seconds between requests.                                                       | `1.0`         |
-| `--retries`   | The number of retries for failed requests.                                                   | `3`           |
-| `--concurrency`| The number of concurrent requests to execute.                                               | `4`           |
-| `--max-pages` | The maximum number of pages to scrape.                                                       | `100`         |
-| `--verbose`   | Enable verbose logging.                                                                      | `False`       |
-| `--timeout`   | Timeout for page navigation in milliseconds.                                                 | `60000`       |
-| `--only`      | Comma-separated list of allowed high-level domains for scraping.                             | `''`          |
+| Flag            | Description                                                                                 | Default Value |
+|-----------------|---------------------------------------------------------------------------------------------|---------------|
+| `url`           | The base URL of the website to scrape.                                                      |               |
+| `--output-dir`  | The directory to save PDFs.                                                                 | `pdfs`        |
+| `--depth`       | The maximum depth of recursion for scraping.                                                | `2`           |
+| `--page-size`   | The page size for the PDFs (e.g., A4, Letter, Legal, etc.).                                  | `A4`          |
+| `--delay`       | The delay in seconds between requests.                                                      | `1.0`         |
+| `--retries`     | The number of retries for failed requests.                                                  | `3`           |
+| `--concurrency` | The number of concurrent requests to execute.                                               | `4`           |
+| `--max-pages`   | The maximum number of pages to scrape.                                                      | `100`         |
+| `--verbose`     | Enable verbose logging.                                                                     | `False`       |
+| `--timeout`     | Timeout for page navigation in milliseconds.                                                | `60000`       |
+| `--only`        | Comma-separated list of allowed high-level domains for scraping.                            | `''`          |
+| `--merge`       | Merge all created PDFs into a single file.                                                  | `False`       |
+| `--exclude-url` | Comma-separated list of URLs to exclude from scraping.                                       | `''`          |
+| `--links-only`  | Only scrape links from the origin page without converting it to PDF.                        | `False`       |
+| `--pagination`  | Enable pagination handling for multi-page content.                                          | `False`       |
 
 ## Installation
 
@@ -67,7 +73,7 @@ To install the required dependencies, run:
 pip install -r requirements.txt
 ```
 
-Install additional dependeencies:
+Install additional dependencies:
 
 For MacOS:
 ```sh
@@ -81,7 +87,7 @@ sudo apt-get install gs
 sudo apt-get install inkscape
 ```
 
-For Windows (WLS):
+For Windows (WSL):
 ```sh
 sudo apt install gs
 sudo apt install inkscape
